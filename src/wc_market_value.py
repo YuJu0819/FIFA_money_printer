@@ -103,30 +103,14 @@ def fetch_player_value_history(player_id: str | int, use_cache=True) -> pd.DataF
 # 2. Build a per-country point-in-time squad-value series
 # ---------------------------------------------------------------------------
 def value_asof(history: pd.DataFrame, when: pd.Timestamp) -> float:
-    """A player's value as of `when` = last data point dated <= when (else NaN).
-
-    AS-OF POLICY (read alongside attach_market_value): this is INCLUSIVE of
-    `when`. A player's public market value on match-day morning is known before
-    kickoff (Transfermarkt revalues from form over weeks, never from the single
-    result we are predicting), so using a revaluation dated exactly `when` is not
-    leakage. The country-snapshot join in attach_market_value is deliberately
-    stricter (strictly-before) because those monthly snapshots are coarser.
-
-    Vectorized with searchsorted (history is sorted ascending by parse_*); this
-    is O(log n) per call instead of a full O(n) boolean scan.
-    """
-    dates = history["date"].to_numpy()            # sorted ascending
-    if len(dates) == 0:
-        return np.nan
-    idx = int(np.searchsorted(dates, np.datetime64(when), side="right")) - 1
-    if idx < 0:
-        return np.nan
-    return float(history["value_eur"].iloc[idx])
+    """A player's value as of `when` = last data point dated <= when (else NaN)."""
+    past = history[history["date"] <= when]
+    return float(past["value_eur"].iloc[-1]) if len(past) else np.nan
 
 
 def build_country_series(
     squads: dict[str, list],
-    histories: dict, 
+    histories: dict,
     snapshot_dates: pd.DatetimeIndex,
 ) -> pd.DataFrame:
     """Sum point-in-time player values into a per-country, per-snapshot total.
@@ -142,7 +126,8 @@ def build_country_series(
     rows = []
     for country, pids in squads.items():
         for d in snapshot_dates:
-            vals = [value_asof(histories[p], d) for p in pids if p in histories]
+            vals = [value_asof(histories[p], d)
+                    for p in pids if p in histories]
             vals = [v for v in vals if not np.isnan(v)]
             if vals:
                 rows.append((country, d, float(np.sum(vals))))
@@ -163,21 +148,31 @@ def load_country_series_from_csv(path: str) -> pd.DataFrame:
 EXTRA_FEATURES = ["mv_log_diff", "mv_missing"]
 
 
-def attach_market_value(matches: pd.DataFrame, country_series: pd.DataFrame
-                        ) -> pd.DataFrame:
+def attach_market_value(matches: pd.DataFrame, country_series: pd.DataFrame,
+                        max_staleness_days: int = 550) -> pd.DataFrame:
     """Add mv_log_home, mv_log_away, mv_log_diff, mv_missing to `matches`.
 
     Uses merge_asof with direction='backward' and allow_exact_matches=False, so
     each match only ever sees a squad value dated STRICTLY BEFORE its own date.
+    `max_staleness_days` caps how far a value carries forward: a match more than
+    this many days after a nation's last squad-value snapshot gets NaN instead of
+    a stale carry-forward (matters for teams with no currently-valued players).
     """
-    cs = country_series.sort_values("date")[["country", "date", "mv_eur"]]
-    m = matches.sort_values("date").reset_index().rename(columns={"index": "_orig"})
+    cs = country_series.copy()
+    cs["date"] = pd.to_datetime(cs["date"]).astype("datetime64[ns]")
+    cs = cs.sort_values("date")[["country", "date", "mv_eur"]]
+    matches = matches.copy()
+    matches["date"] = pd.to_datetime(matches["date"]).astype("datetime64[ns]")
+    m = matches.sort_values("date").reset_index().rename(
+        columns={"index": "_orig"})
 
     def side_join(team_col, out_col):
-        left = m[["_orig", "date", team_col]].rename(columns={team_col: "country"})
+        left = m[["_orig", "date", team_col]].rename(
+            columns={team_col: "country"})
         left = left.sort_values("date")
         j = pd.merge_asof(left, cs, on="date", by="country",
-                          direction="backward", allow_exact_matches=False)
+                          direction="backward", allow_exact_matches=False,
+                          tolerance=pd.Timedelta(days=max_staleness_days))
         return j.set_index("_orig")["mv_eur"].rename(out_col)
 
     mv_home = side_join("home_team", "mv_home")

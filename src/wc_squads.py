@@ -18,7 +18,10 @@ WHY TWO INPUT MODES:
 
 LEAKAGE NOTES:
   * Player VALUE is always taken as-of the match date via value_asof, i.e. the
-    last revaluation on/before kickoff -> no value leakage.
+    last revaluation on/before kickoff -> no value leakage. This is INCLUSIVE of
+    the match date on purpose (see value_asof's docstring); it differs from the
+    strictly-before country-snapshot join in attach_market_value, and that
+    asymmetry is deliberate.
   * Roster IDENTITY: editions mode is leakage-free (the window is known ahead).
     lineups mode uses the REALIZED lineup, which is mild optimism (you wouldn't
     know the exact XI pre-kickoff). For a strictly pre-match version, build the
@@ -48,6 +51,58 @@ def competitive_only(df: pd.DataFrame) -> pd.DataFrame:
     """Keep World Cup, continental championships, ALL qualifiers, Nations League,
     etc.; drop friendlies. Apply to the modelling window, NOT before Elo/form."""
     return df[df["tournament"].map(is_competitive)].copy()
+
+
+# ---------------------------------------------------------------------------
+# Confederation tagging (used to drop low-market-value-coverage regions)
+# ---------------------------------------------------------------------------
+def confederation(tournament: str) -> str:
+    """Coarse confederation label from the martj42 tournament name. World Cup
+    finals/qualifiers are global, so they get their own buckets."""
+    t = str(tournament).lower()
+    if "world cup" in t:
+        return "FIFA World Cup" if "qualif" not in t else "World Cup qualifiers"
+    if any(k in t for k in ["uefa", "euro", "nations league"]) and "concacaf" not in t:
+        return "UEFA"
+    if any(k in t for k in ["copa am", "conmebol", "superclásico de las américas"]):
+        return "CONMEBOL"
+    if any(k in t for k in ["concacaf", "gold cup", "caribbean", "uncaf", "cccf",
+                            "nafc", "central american"]):
+        return "CONCACAF"
+    if any(k in t for k in ["african", "africa", "cosafa", "cecafa", "afcon",
+                            "udeac", "cabral", "wafu", "cabral", "nile", "uniffac"]):
+        return "CAF"
+    if any(k in t for k in ["afc", "asian", "gulf", "aff ", "saff", "eaff", "cafa",
+                            "waff", "challenge cup", "asean", "king", "merdeka",
+                            "nehru", "arab", "south asian", "dynasty", "kirin"]):
+        return "AFC"
+    if any(k in t for k in ["oceania", "ofc", "pacific", "melanesia", "polynesia",
+                            "south pacific"]):
+        return "OFC"
+    return "Other/regional"
+
+
+def keep_high_mv_confederations(df: pd.DataFrame, threshold: float = 0.50,
+                                window_mask=None, verbose: bool = True
+                                ) -> pd.DataFrame:
+    """Drop matches whose CONFEDERATION has market-value coverage below `threshold`.
+
+    Coverage = fraction of that confederation's matches with mv present (mv_missing
+    == 0), measured over `window_mask` rows if given (the modelling window) else
+    all rows. mv_missing is known pre-match, so filtering on it is leakage-free.
+    Requires `mv_missing` to already be on df (call after attach_market_value).
+    """
+    conf = df["tournament"].map(confederation)
+    scope = df[window_mask] if window_mask is not None else df
+    scope_conf = scope["tournament"].map(confederation)
+    cov = (1 - scope["mv_missing"]).groupby(scope_conf).mean()
+    keep = set(cov[cov >= threshold].index)
+    if verbose:
+        for c in cov.sort_values(ascending=False).index:
+            mark = "keep" if c in keep else "DROP"
+            print(f"    {mark}  {c:<22} coverage={cov[c]:5.0%}  "
+                  f"n={int((scope_conf == c).sum()):,}")
+    return df[conf.isin(keep)].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +140,14 @@ def squad_value_from_editions(df: pd.DataFrame, editions: pd.DataFrame,
 def squad_value_from_lineups(df: pd.DataFrame, lineups: pd.DataFrame,
                              histories: dict):
     lu = lineups.copy()
-    lu["date"] = pd.to_datetime(lu["date"])
+    # Normalize to midnight so the (date, team) key matches the match table even
+    # if one source carries a time component -- otherwise grp.get silently misses
+    # and every lineup looks empty.
+    lu["date"] = pd.to_datetime(lu["date"]).dt.normalize()
     grp = lu.groupby(["date", "team"])["player_id"].apply(list)
 
     def value(team, date):
-        pids = grp.get((date, team), [])
+        pids = grp.get((pd.Timestamp(date).normalize(), team), [])
         vals = [mvmod.value_asof(histories[p], date)
                 for p in pids if p in histories]
         vals = [v for v in vals if pd.notna(v)]
@@ -121,16 +179,24 @@ def recent_caps_squads(df: pd.DataFrame, lineups: pd.DataFrame, n_matches: int =
 # ---------------------------------------------------------------------------
 # Finalize -> the columns the walk-forward consumes
 # ---------------------------------------------------------------------------
-EXTRA_FEATURES = ["mv_log_diff", "mv_missing"]
+# Re-export the single definition from wc_market_value so the two paths
+# (country-series join vs per-match squad) always emit the same feature names.
+EXTRA_FEATURES = mvmod.EXTRA_FEATURES
+
+
+def _safe_log10(s: pd.Series) -> pd.Series:
+    """log10 that maps non-positive (and NaN) values to NaN instead of -inf."""
+    s = pd.to_numeric(s, errors="coerce")
+    return np.log10(s.where(s > 0))
 
 
 def finalize(df: pd.DataFrame, mv_home: pd.Series, mv_away: pd.Series
              ) -> pd.DataFrame:
     out = df.copy()
-    out["mv_home"] = pd.Series(mv_home, index=df.index)
-    out["mv_away"] = pd.Series(mv_away, index=df.index)
-    out["mv_log_home"] = np.log10(out["mv_home"])
-    out["mv_log_away"] = np.log10(out["mv_away"])
+    out["mv_home"] = mv_home          # Series from .apply -> aligns on df.index
+    out["mv_away"] = mv_away
+    out["mv_log_home"] = _safe_log10(out["mv_home"])
+    out["mv_log_away"] = _safe_log10(out["mv_away"])
     out["mv_log_diff"] = out["mv_log_home"] - out["mv_log_away"]
     out["mv_missing"] = out["mv_log_diff"].isna().astype(int)
     return out
