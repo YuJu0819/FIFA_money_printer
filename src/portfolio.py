@@ -37,13 +37,14 @@ def implied_probs(odds: dict) -> dict:
 
 def find_bets(label: str, probs: dict, odds: dict,
               kelly: float = 0.25, edge_threshold: float = 0.03) -> list:
-    """All +EV outcomes for one match (before global capping)."""
+    """All +EV outcomes for one match (before global capping). Works for ANY
+    market in `odds` (1X2, over_2.5, under_2.5, ...) as long as `probs` has a
+    matching model probability for that key."""
     bets = []
-    for k in OUTCOMES:
-        o = odds.get(k)
-        if not o or o <= 1:
+    for k, o in odds.items():
+        p = probs.get(k)
+        if p is None or not o or o <= 1:
             continue
-        p = probs[k]
         edge = p * o - 1.0
         if edge >= edge_threshold:
             bets.append({
@@ -102,7 +103,10 @@ def portfolio_from_predictor(predictor, matches: list, **kw) -> pd.DataFrame:
     Fills in model probabilities via the predictor, then builds the portfolio."""
     enriched = []
     for m in matches:
-        probs = predictor.predict(m["home"], m["away"], m.get("neutral", True))
+        # ask the predictor for every market the odds reference (1X2 + O/U lines)
+        probs = predictor.predict_markets(m["home"], m["away"],
+                                          m.get("neutral", True),
+                                          odds_keys=list(m["odds"].keys()))
         enriched.append({"label": m.get("label", f"{m['home']} v {m['away']}"),
                          "probs": probs, "odds": m["odds"]})
     bankroll = kw.get("bankroll", 1000.0)
@@ -120,7 +124,8 @@ if __name__ == "__main__":
     # demo fixtures with made-up bookmaker odds (home_win / draw / away_win)
     matches = [
         {"home": "Spain", "away": "England", "neutral": True,
-         "odds": {"home_win": 2.10, "draw": 3.30, "away_win": 4.20}},
+         "odds": {"home_win": 2.10, "draw": 3.30, "away_win": 4.20,
+                  "over_2.5": 2.05, "under_2.5": 1.75}},      # secondary market
         {"home": "France", "away": "Germany", "neutral": True,
          "odds": {"home_win": 1.80, "draw": 3.60, "away_win": 4.50}},
         {"home": "Brazil", "away": "Argentina", "neutral": True,

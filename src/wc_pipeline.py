@@ -22,6 +22,7 @@ Then point DATA_PATH at results.csv.
 
 from __future__ import annotations
 import os
+import math
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -43,6 +44,14 @@ FORM_WINDOW = 10               # matches in the rolling-form features
 TEST_FRACTION = 0.2            # most-recent slice of the window held out for test
 HOME_ADV_ELO = 0          # Elo points added to a non-neutral home side
 ELO_START = 1500.0
+
+# Glicko-1 (dynamic rating WITH uncertainty). The extra signal over Elo is the
+# rating deviation (RD): high for rarely-playing nations, so the model can
+# discount big rating gaps it isn't sure about.
+GLICKO_R0 = 1500.0
+GLICKO_RD0 = 350.0            # starting / max uncertainty
+GLICKO_C2 = 165.0            # RD^2 growth per day of inactivity (~2yr full reset)
+GLICKO_Q = math.log(10) / 400.0
 
 # K-factor by competition tier (World Football Elo style, keyword-matched).
 TOURNAMENT_K = {
@@ -252,6 +261,152 @@ def add_head_to_head(df: pd.DataFrame, shrink: float = 5.0) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 3d. Glicko-1 dynamic ratings (rating + uncertainty), pre-match snapshots
+# ---------------------------------------------------------------------------
+def _glicko_g(rd):
+    return 1.0 / np.sqrt(1.0 + 3.0 * GLICKO_Q ** 2 * rd ** 2 / np.pi ** 2)
+
+
+def _glicko_update(r, rd, rj, rdj, s):
+    """One-game Glicko-1 update of (r, rd) vs opponent (rj, rdj), outcome s."""
+    g = _glicko_g(rdj)
+    E = 1.0 / (1.0 + 10 ** (-g * (r - rj) / 400.0))
+    inv_d2 = GLICKO_Q ** 2 * g ** 2 * E * (1 - E)
+    denom = 1.0 / rd ** 2 + inv_d2
+    return r + (GLICKO_Q / denom) * g * (s - E), math.sqrt(1.0 / denom)
+
+
+def add_glicko(df: pd.DataFrame) -> pd.DataFrame:
+    """Sweep chronologically storing each team's PRE-match Glicko rating and RD
+    (no leakage). Adds: glicko_diff (strength, parallel to elo_diff), glicko_unc
+    (combined RD = how unsure we are), glicko_exp (uncertainty-SHRUNK win
+    expectancy -- the principled single feature: a big rating gap counts for less
+    when either side is rarely-rated)."""
+    n = len(df)
+    gh = np.empty(n); ga = np.empty(n); rdh = np.empty(n); rda = np.empty(n)
+    r: dict[str, float] = {}
+    rd: dict[str, float] = {}
+    last: dict[str, pd.Timestamp] = {}
+    for i, row in enumerate(df.itertuples(index=False)):
+        h, a, date = row.home_team, row.away_team, row.date
+        rh, RDh = r.get(h, GLICKO_R0), rd.get(h, GLICKO_RD0)
+        ra, RDa = r.get(a, GLICKO_R0), rd.get(a, GLICKO_RD0)
+        if h in last:
+            RDh = min(math.sqrt(RDh ** 2 + GLICKO_C2 * (date - last[h]).days), GLICKO_RD0)
+        if a in last:
+            RDa = min(math.sqrt(RDa ** 2 + GLICKO_C2 * (date - last[a]).days), GLICKO_RD0)
+        gh[i], ga[i], rdh[i], rda[i] = rh, ra, RDh, RDa
+
+        gd = row.home_score - row.away_score
+        s_h = 1.0 if gd > 0 else (0.5 if gd == 0 else 0.0)
+        nr_h, nrd_h = _glicko_update(rh, RDh, ra, RDa, s_h)
+        nr_a, nrd_a = _glicko_update(ra, RDa, rh, RDh, 1.0 - s_h)
+        r[h], rd[h], r[a], rd[a] = nr_h, nrd_h, nr_a, nrd_a
+        last[h] = last[a] = date
+
+    df = df.copy()
+    adv = np.where(df["neutral"], 0.0, HOME_ADV_ELO)
+    df["glicko_diff"] = gh + adv - ga
+    df["glicko_unc"] = np.sqrt(rdh ** 2 + rda ** 2)
+    g_comb = _glicko_g(df["glicko_unc"].to_numpy())
+    df["glicko_exp"] = 1.0 / (1.0 + 10 ** (-g_comb * df["glicko_diff"].to_numpy() / 400.0))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 3d-bis. Glicko-2: adds a per-team VOLATILITY (how erratic results are)
+# ---------------------------------------------------------------------------
+_G2_SCALE = 173.7178
+GLICKO2_TAU = 0.5            # system constant (how fast volatility can change)
+GLICKO2_PERIOD_DAYS = 30.0  # one "rating period" for time-based RD growth
+GLICKO2_SIGMA0 = 0.06       # initial volatility
+
+
+def _g2_volatility(sigma, phi, v, delta, tau=GLICKO2_TAU):
+    """Glickman's Illinois-algorithm solve for the new volatility."""
+    a = math.log(sigma * sigma)
+
+    def f(x):
+        ex = math.exp(x)
+        d2 = delta * delta
+        return (ex * (d2 - phi * phi - v - ex) /
+                (2.0 * (phi * phi + v + ex) ** 2) - (x - a) / (tau * tau))
+
+    A = a
+    if delta * delta > phi * phi + v:
+        B = math.log(delta * delta - phi * phi - v)
+    else:
+        k = 1
+        while f(a - k * tau) < 0:
+            k += 1
+        B = a - k * tau
+    fA, fB = f(A), f(B)
+    it = 0
+    while abs(B - A) > 1e-6 and it < 100:
+        C = A + (A - B) * fA / (fB - fA)
+        fC = f(C)
+        if fC * fB <= 0:
+            A, fA = B, fB
+        else:
+            fA *= 0.5
+        B, fB = C, fC
+        it += 1
+    return math.exp(A / 2.0)
+
+
+def _g2_step(mu, phi, sigma, mu_j, phi_j, s):
+    g = 1.0 / math.sqrt(1.0 + 3.0 * phi_j * phi_j / math.pi ** 2)
+    E = min(max(1.0 / (1.0 + math.exp(-g * (mu - mu_j))), 1e-9), 1 - 1e-9)
+    v = 1.0 / (g * g * E * (1 - E))
+    delta = v * g * (s - E)
+    sigma2 = _g2_volatility(sigma, phi, v, delta)
+    phi_star = math.sqrt(phi * phi + sigma2 * sigma2)
+    phi_new = 1.0 / math.sqrt(1.0 / (phi_star * phi_star) + 1.0 / v)
+    return mu + phi_new * phi_new * g * (s - E), phi_new, sigma2
+
+
+def add_glicko2(df: pd.DataFrame) -> pd.DataFrame:
+    """Glicko-2 sweep -> glicko2_diff, glicko2_unc, glicko2_exp (uncertainty-
+    shrunk expectancy, like glicko_exp) plus glicko2_vol (combined volatility:
+    how erratic the two teams' results are -- the new Glicko-2 signal).
+
+    NOT used by default (kept for reference). Tested verdict: the volatility
+    signal is useless here (sigma is ~constant 0.084 across teams), and although
+    glicko2_exp is marginally better than glicko_exp on LR alone (0.8466->0.8450),
+    it is WORSE in the production LR+DC blend (0.8400 vs 0.8393). Glicko-1 stays."""
+    n = len(df)
+    rh = np.empty(n); ra = np.empty(n); rdh = np.empty(n); rda = np.empty(n)
+    vh = np.empty(n); va = np.empty(n)
+    mu, phi, sig, last = {}, {}, {}, {}
+    phi0 = GLICKO_RD0 / _G2_SCALE
+    for i, row in enumerate(df.itertuples(index=False)):
+        h, a, date = row.home_team, row.away_team, row.date
+        mh, ph, sh = mu.get(h, 0.0), phi.get(h, phi0), sig.get(h, GLICKO2_SIGMA0)
+        ma, pa, sa = mu.get(a, 0.0), phi.get(a, phi0), sig.get(a, GLICKO2_SIGMA0)
+        if h in last:
+            ph = min(math.sqrt(ph * ph + sh * sh * max((date - last[h]).days / GLICKO2_PERIOD_DAYS, 0)), phi0)
+        if a in last:
+            pa = min(math.sqrt(pa * pa + sa * sa * max((date - last[a]).days / GLICKO2_PERIOD_DAYS, 0)), phi0)
+        rh[i], ra[i] = 1500 + _G2_SCALE * mh, 1500 + _G2_SCALE * ma
+        rdh[i], rda[i] = _G2_SCALE * ph, _G2_SCALE * pa
+        vh[i], va[i] = sh, sa
+        gd = row.home_score - row.away_score
+        s_h = 1.0 if gd > 0 else (0.5 if gd == 0 else 0.0)
+        mu[h], phi[h], sig[h] = _g2_step(mh, ph, sh, ma, pa, s_h)
+        mu[a], phi[a], sig[a] = _g2_step(ma, pa, sa, mh, ph, 1.0 - s_h)
+        last[h] = last[a] = date
+
+    df = df.copy()
+    adv = np.where(df["neutral"], 0.0, HOME_ADV_ELO)
+    df["glicko2_diff"] = rh + adv - ra
+    df["glicko2_unc"] = np.sqrt(rdh ** 2 + rda ** 2)
+    gc = _glicko_g(df["glicko2_unc"].to_numpy())
+    df["glicko2_exp"] = 1.0 / (1.0 + 10 ** (-gc * df["glicko2_diff"].to_numpy() / 400.0))
+    df["glicko2_vol"] = np.sqrt(vh ** 2 + va ** 2)
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 3c. Context features: confederation matchup, host/continental edge, importance
 # ---------------------------------------------------------------------------
 CONFEDS = ["UEFA", "CONMEBOL", "CONCACAF", "CAF", "AFC", "OFC"]
@@ -316,6 +471,7 @@ FEATURES = [
     "form_gf_home", "form_gf_away",      # offense (goals scored)
     "form_ga_home", "form_ga_away",      # defense (goals conceded)
     "h2h_home_winrate", "h2h_home_gd", "h2h_logn",   # team-vs-team history
+    "glicko_exp",                        # uncertainty-shrunk win expectancy (Glicko)
 ] + (CONTEXT_FEATURES if USE_CONTEXT_FEATURES else [])
 
 
@@ -346,6 +502,7 @@ def build_features(df: pd.DataFrame, former_names_path: str | None = None,
     df, ratings = add_elo(df)
     df = add_form(df, FORM_WINDOW)
     df = add_head_to_head(df)
+    df = add_glicko(df)
     if USE_CONTEXT_FEATURES:
         df = add_context_features(df, build_team_confederation(df))
     df["is_neutral"] = df["neutral"].astype(int)

@@ -95,6 +95,23 @@ def load_national_pool(path: str) -> pd.DataFrame:
     return df[keep]
 
 
+def load_injuries(path: str) -> pd.DataFrame:
+    """player_injuries: dated spells [player_id, from_date, end_date]. Returns
+    [player_id, from_ns, end_ns] (int64 ns) for the availability filter in
+    build_country_value_series."""
+    df = pd.read_csv(path, low_memory=False)
+    f = pd.to_datetime(df["from_date"], errors="coerce")
+    e = pd.to_datetime(df["end_date"], errors="coerce")
+    m = (f.notna() & e.notna()).to_numpy()
+    # force NANOseconds (astype int64 alone yields the column's unit -- us in
+    # pandas 2.x -- which would be 1000x off vs the ns grid in the value series).
+    return pd.DataFrame({
+        "player_id": df["player_id"].to_numpy()[m],
+        "from_ns": f[m].dt.as_unit("ns").astype("int64").to_numpy(),
+        "end_ns": e[m].dt.as_unit("ns").astype("int64").to_numpy(),
+    })
+
+
 def resolve_team_names(team_ids, api_base="https://transfermarkt-api.fly.dev",
                        fetch_json=None) -> dict:
     """Map the ~200 distinct national team_ids -> country name via the felipeall
@@ -159,6 +176,7 @@ def build_country_value_series(
     liveness_months: int = 18,
     agg: str = "top_n_mean",
     top_n: int = 30,
+    injuries: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-country point-in-time squad value on a monthly grid.
 
@@ -204,6 +222,13 @@ def build_country_value_series(
     mv_by_player = {pid: (g["_ns"].to_numpy(), g["value_eur"].to_numpy())
                     for pid, g in mv.groupby("player_id")}
 
+    # injury intervals per player (ns), so an injured player is dropped from the
+    # squad value on dates inside any of his spells (availability adjustment).
+    inj_by_player: dict = {}
+    if injuries is not None and len(injuries):
+        for pid, g in injuries.groupby("player_id"):
+            inj_by_player[pid] = (g["from_ns"].to_numpy(), g["end_ns"].to_numpy())
+
     rows = []
     for country, grp in pool.groupby("country"):
         # One row per player: their LIVE as-of value over the grid (NaN = not in
@@ -224,6 +249,12 @@ def build_country_value_series(
             if pd.notna(fg):
                 live &= grid_i64 >= pd.Timestamp(
                     fg).as_unit("ns").value  # debuted
+            spells = inj_by_player.get(pid)
+            if spells is not None:           # drop dates the player is injured
+                f_ns, e_ns = spells
+                injured = ((grid_i64[:, None] >= f_ns) &
+                           (grid_i64[:, None] <= e_ns)).any(axis=1)
+                live &= ~injured
             cols.append(np.where(live, asof_val, np.nan))
         if not cols:
             continue
@@ -261,16 +292,110 @@ def align_names(country_series: pd.DataFrame, alias: dict | None = None
 
 
 # ---------------------------------------------------------------------------
+# Player-level valuation for LIVE what-if overrides (drop named players)
+# ---------------------------------------------------------------------------
+class SquadValuer:
+    """Recompute a nation's top-N squad value at a date while DROPPING named or
+    injured players -- the engine behind MatchPredictor's `unavailable=` override.
+    Mirrors build_country_value_series (top-N mean, same liveness) so the
+    no-exclusion value matches the country series."""
+
+    def __init__(self, data_dir: str = "../data", top_n: int = 30,
+                 liveness_months: int = 18, use_injuries: bool = True):
+        import os
+        mv = load_market_values(os.path.join(
+            data_dir, "player_market_value", "player_market_value.csv"))
+        pool = load_national_pool(os.path.join(
+            data_dir, "player_national_performances",
+            "player_national_performances.csv"))
+        pp_path = os.path.join(data_dir, "player_profiles", "player_profiles.csv")
+        tmap = build_team_name_map(pool, pp_path)
+        pool = pool.assign(country=pool["team_id"].map(tmap)).dropna(
+            subset=["country"]).drop_duplicates(["country", "player_id"])
+        self.players_by_country = {c: set(g) for c, g
+                                   in pool.groupby("country")["player_id"]}
+        self.mv_by_player = {
+            pid: (g["date"].dt.as_unit("ns").astype("int64").to_numpy(),
+                  g["value_eur"].to_numpy())
+            for pid, g in mv.sort_values(["player_id", "date"]).groupby("player_id")}
+        self.top_n = top_n
+        self.live_ns = int(liveness_months * 30 * 24 * 3600 * 1e9)
+        self.inj = {}
+        if use_injuries:
+            inj = load_injuries(os.path.join(
+                data_dir, "player_injuries", "player_injuries.csv"))
+            self.inj = {pid: (g["from_ns"].to_numpy(), g["end_ns"].to_numpy())
+                        for pid, g in inj.groupby("player_id")}
+        pp = pd.read_csv(pp_path, low_memory=False,
+                         usecols=["player_id", "player_name"])
+        self.id2name = dict(zip(pp["player_id"], pp["player_name"]))
+        self.name2ids: dict = {}
+        for pid, nm in zip(pp["player_id"], pp["player_name"]):
+            if isinstance(nm, str):
+                self.name2ids.setdefault(nm.lower().strip(), []).append(pid)
+
+    def _asof(self, pid, dns):
+        pv = self.mv_by_player.get(pid)
+        if pv is None:
+            return np.nan
+        ns, vals = pv
+        i = int(np.searchsorted(ns, dns, "right")) - 1
+        if i < 0 or dns - ns[i] > self.live_ns:
+            return np.nan
+        return float(vals[i])
+
+    def _injured(self, pid, dns):
+        s = self.inj.get(pid)
+        return bool(s is not None and ((dns >= s[0]) & (dns <= s[1])).any())
+
+    def resolve(self, name, country_pool=None) -> set:
+        """player name (or id) -> set of player_ids; disambiguates to the pool."""
+        if isinstance(name, (int, np.integer)):
+            return {int(name)}
+        ids = set(self.name2ids.get(str(name).lower().strip(), []))
+        if country_pool is not None and (ids & country_pool):
+            ids &= country_pool
+        return ids
+
+    def squad(self, profiles_country, date, exclude_ids=()) -> list:
+        """Available top-N as [(player_id, name, value)], best first."""
+        dns = pd.Timestamp(date).value
+        ex = set(exclude_ids)
+        out = []
+        for pid in self.players_by_country.get(profiles_country, ()):
+            if pid in ex or self._injured(pid, dns):
+                continue
+            v = self._asof(pid, dns)
+            if not np.isnan(v):
+                out.append((pid, self.id2name.get(pid, str(pid)), v))
+        out.sort(key=lambda t: -t[2])
+        return out[:self.top_n]
+
+    def value(self, martj42_country, date, exclude=()) -> float:
+        """Top-N mean squad value (EUR) for a martj42 nation, dropping `exclude`
+        (player names or ids) and anyone injured at `date`."""
+        pc = NAME_ALIAS.get(martj42_country, martj42_country)
+        pool = self.players_by_country.get(pc, set())
+        ex = set()
+        for x in exclude:
+            ex |= self.resolve(x, pool)
+        sq = self.squad(pc, date, ex)
+        return float(np.mean([v for _, _, v in sq])) if sq else np.nan
+
+
+# ---------------------------------------------------------------------------
 # Recipe runner: build the leakage-safe country value series from the salimt
 # CSVs and write it to disk.  Run:  python wc_squad_dataset.py [DATA_DIR] [OUT]
 # ---------------------------------------------------------------------------
 def build_series_from_dir(data_dir: str = "../data",
                           freq: str = "MS", liveness_months: int = 18,
                           min_players: int = 5, min_purity: float = 0.6,
-                          agg: str = "top_n_mean", top_n: int = 30
+                          agg: str = "top_n_mean", top_n: int = 30,
+                          use_injuries: bool = False
                           ) -> pd.DataFrame:
-    """End-to-end: load the three salimt CSVs, resolve team names offline, build
-    the per-country point-in-time value series, and align to martj42 names."""
+    """End-to-end: load the salimt CSVs, resolve team names offline, build the
+    per-country point-in-time value series, and align to martj42 names.
+    use_injuries=True drops injured players from the squad value at each date."""
     import os
     mv_path = os.path.join(data_dir, "player_market_value",
                            "player_market_value.csv")
@@ -282,11 +407,16 @@ def build_series_from_dir(data_dir: str = "../data",
     pool = load_national_pool(np_path)
     tmap = build_team_name_map(pool, pp_path,
                                min_purity=min_purity, min_players=min_players)
+    inj = None
+    if use_injuries:
+        inj = load_injuries(os.path.join(data_dir, "player_injuries",
+                                         "player_injuries.csv"))
+        print(f"injury spells: {len(inj):,} (availability adjustment ON)")
     print(f"market values: {len(mv):,} rows | pool: {len(pool):,} rows | "
           f"team_ids named: {len(tmap)} ({len(set(tmap.values()))} countries)")
     cs = build_country_value_series(mv, pool, tmap, freq=freq,
                                     liveness_months=liveness_months,
-                                    agg=agg, top_n=top_n)
+                                    agg=agg, top_n=top_n, injuries=inj)
     cs = align_names(cs)
     label = f"top-{top_n} mean" if agg == "top_n_mean" else agg
     print(f"country value series ({label}): {len(cs):,} rows, "

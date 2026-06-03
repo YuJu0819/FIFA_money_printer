@@ -33,6 +33,8 @@ def main():
                     help="run the baseline backtest without market value")
     ap.add_argument("--model", default="lr", choices=["lr", "hgb", "both"],
                     help="model: logistic regression, gradient boosting, or both")
+    ap.add_argument("--injuries", action="store_true",
+                    help="drop injured players from squad value (availability)")
     args = ap.parse_args()
 
     results = os.path.join(args.data_dir, "results.csv")
@@ -51,7 +53,7 @@ def main():
     # 1) build (or load) the country squad-value series
     if args.rebuild or not os.path.exists(args.cache):
         print(">> Building country squad-value series from salimt CSVs ...")
-        cs = sd.build_series_from_dir(args.data_dir)
+        cs = sd.build_series_from_dir(args.data_dir, use_injuries=args.injuries)
         cs.to_csv(args.cache, index=False)
         print(f"   cached -> {args.cache}\n")
     else:
