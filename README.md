@@ -6,7 +6,42 @@ markets. The model is a **logistic-regression + Dixon-Coles goals-model blend** 
 Elo, form, head-to-head, and Glicko features.
 
 See **[SUMMARY.pdf](SUMMARY.pdf)** for the full story (methodology, results, and every
-idea that was tested and ruled out).
+idea that was tested — both what worked and what didn't).
+
+## How the model works (best configuration)
+
+Validated SOTA: **0.839 out-of-sample log loss** (3-way), **beats the Elo baseline in 16 of
+17 walk-forward folds**, and well-calibrated (predicted draw rate 0.221 vs 0.220 actual).
+
+**Data.** International matches since 2000. Elo / form / H2H / Glicko are computed over the
+full history; only friendlies are dropped from the model's training rows (kept in the ratings).
+
+**Features (12, all causal pre-match snapshots):**
+- `elo_diff` — competition-weighted Elo (the dominant signal)
+- `is_neutral`
+- rolling form (last 10 games): points, plus an offense/defense split (goals scored / conceded), home & away
+- head-to-head vs the *specific* opponent: shrunk win rate, goal difference, log(#meetings)
+- `glicko_exp` — an uncertainty-shrunk Glicko win expectancy (discounts the rating gap when a team is rarely rated)
+
+**Two models, blended 50/50:**
+1. **Logistic regression** on the 12 features, trained on competitive matches with exponential
+   time-decay weights. Linear, calibrated, and — proven by experiment — hard to beat here.
+2. **Dixon-Coles goals model**: per-team attack/defense + home edge by time-weighted maximum
+   likelihood from goals (fit on *all* history with a ~5-year half-life, since international
+   teams play rarely), with the low-score correction. Produces the full scoreline matrix.
+
+The blend wins because the two are **decorrelated** (a feature classifier vs a goals process):
+averaging captures both, and the goals model repairs the draw structure the classifier misses.
+1X2 log loss went **0.848** (LR alone) → **0.842** (blend) → **0.839** (Dixon-Coles on
+expanding history).
+
+**Secondary markets** (over/under, total-goals buckets, 3-way handicap) are derived from the
+scoreline matrix **reconciled** to the blend's better 1X2 — so they inherit the blend's
+calibration *plus* Dixon-Coles' "win by 1 vs win by 2+" margin detail. `wc=True` applies a
+~+8% World-Cup goal-scale (a real, measured effect) that sharpens totals/handicap at WC finals.
+
+**Live prediction** uses a synthetic-row trick: the fixture is appended to the results and the
+exact training feature pipeline is re-run, so live and training features can never drift.
 
 ## Setup
 

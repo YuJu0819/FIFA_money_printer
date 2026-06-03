@@ -72,7 +72,13 @@ def _market_groups(odds: dict) -> list:
         elif k.startswith("goals_"):
             g.setdefault("totals", []).append(k)
         elif k.startswith("hcap_"):
-            g.setdefault("hcap_" + k.split("_")[2].lstrip("+-"), []).append(k)
+            # group a 3-way Taiwan handicap by its HOME-perspective line so the
+            # -1 and +1 lines stay SEPARATE markets (home/draw use the suffix
+            # line; away flips sign).
+            parts = k.split("_")
+            lv = float(parts[2])
+            home_line = -lv if parts[1] == "away" else lv
+            g.setdefault(f"hcap_{home_line:+g}", []).append(k)
         else:
             g.setdefault(k, []).append(k)
     return list(g.values())
@@ -90,10 +96,12 @@ def find_bets(label: str, probs: dict, odds: dict,
               kelly: float = 0.25, edge_threshold: float = 0.03,
               pushes: dict = None, devig_method: str = "shin") -> list:
     """All +EV outcomes for one match (before global capping). Works for ANY
-    market in `odds` (1X2, over/under, goal buckets, handicap, ...) as long as
-    `probs` has a model probability for that key. `pushes[key]` (e.g. an Asian
-    handicap landing exactly on the line) returns the stake, so EV and Kelly use
-    edge = p*o - (1 - push); full-Kelly = edge / (o - 1).
+    market in `odds` (1X2, over/under, goal buckets, Taiwan 3-way handicap, ...)
+    as long as `probs` has a model probability for that key. EV and Kelly use
+    edge = p*o - (1 - push); full-Kelly = edge / (o - 1). `pushes[key]` is the
+    refunded-stake probability (a real Asian-handicap push); for the Taiwan
+    3-way handicap there is NO refund -- the adjusted tie is its own bettable
+    `hcap_draw_*` outcome -- so push defaults to 0 and edge reduces to p*o - 1.
 
     `fair_p` is the bookmaker's vig-free probability (devigged); `vs_fair` =
     p_model - fair_p flags whether you genuinely disagree with the SHARP market

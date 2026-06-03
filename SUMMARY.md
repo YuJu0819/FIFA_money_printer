@@ -59,6 +59,33 @@ Net gain **0.8484 -> 0.8393** (~1.1%). The wins came from richer TARGET (goals m
 and more DATA (Glicko ratings; DC on all history), never from a fancier model class.
 The model is **well-calibrated** (draw class 0.221 predicted vs 0.220 actual).
 
+## Trials ledger — what worked and what didn't
+Every idea below was tested with a proper causal backtest (not intuition). The pattern is the
+headline result: **gains came from a richer target and more data; everything that tried to add
+"a new signal beyond team strength" failed**, because Elo already integrates whatever shows up
+in results.
+
+| Trial | Outcome |
+|---|---|
+| Offense/defense form split + head-to-head | ✅ 0.8484 -> 0.8449 |
+| Dixon-Coles goals model, blended with LR | ✅ 0.8419; fixes draws, unlocks secondary markets |
+| Glicko-1 uncertainty (`glicko_exp`) | ✅ 0.8405; 16/17 folds beat Elo |
+| Dixon-Coles on expanding history + ~5y decay | ✅ 0.8393 (current SOTA) |
+| World Cup goal-scale (secondary markets) | ✅ real, ~2.6 SE effect; sharpens totals/handicap |
+| Blend-reconciled secondary markets; devig + `vs_fair` | ✅ betting-layer correctness |
+| Gradient boosting (HGB) / EBM | ❌ overfit; LR wins (signal-limited, not capacity-limited) |
+| DC rho widening / bivariate Poisson | ❌ rho not at bound; conditional goal corr ~0 |
+| Glicko-2 volatility | ❌ sigma ~constant; worse than Glicko-1 in the blend |
+| Confederation / host / competition-importance | ❌ no measurable effect |
+| Team-level H2H aggregates (mean/std) | ❌ re-encode strength; nil |
+| Closeness feature / adaptive LR-DC blend (for draws) | ❌ both null |
+| Pairwise "bogey team" beyond Elo; H2H post-processing | ❌ corr +0.02; post-process hurts |
+| Momentum / win-streak | ❌ residual corr ~0; captured by Elo+form |
+| Market value as a strength feature | ⚠️ ~77% redundant with Elo; opt-in, marginal |
+| Injury availability (historical) | ⚠️ negligible backtest lift; real value is LIVE |
+| Squad chemistry (causal, from transfer_history) | ❌ orthogonal to strength but residual corr -0.007 |
+| Squad-value concentration (Gini / CV / top-1) | ❌ distribution shape; residual corr ~0 |
+
 ## Why we're at the ceiling — the error budget
 40% of matches carry 68% of all log loss, in two near-irreducible buckets:
 | match type | % matches | % of total log loss | mean log loss |

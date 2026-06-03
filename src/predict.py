@@ -194,9 +194,12 @@ class MatchPredictor:
           home_win/draw/away_win    -- 1X2 blend
           over_X / under_X          -- totals line X
           goals_0_1/2_3/4plus       -- total-goals buckets
-          hcap_home_-1 / hcap_away_+1 / ... -- Asian handicap (push in `pushes`)
-        reconcile=True derives the secondary markets from the blend-rescaled
-        scoreline matrix (better-calibrated 1X2 baked in)."""
+          hcap_home_-1 / hcap_draw_-1 / hcap_away_+1 / ... -- Taiwan 3-way handicap
+        Taiwan handicap is a 3-way market: on an integer line the adjusted tie is
+        a separate bettable `hcap_draw_*` outcome, NOT a stake refund. `pushes` is
+        therefore always empty (kept for the caller's tuple unpack); 3-way EV uses
+        no push term. reconcile=True derives the secondary markets from the
+        blend-rescaled scoreline matrix (better-calibrated 1X2 baked in)."""
         import dixon_coles as dcm
         probs = self.predict(home, away, neutral)
         pushes = {}
@@ -218,10 +221,13 @@ class MatchPredictor:
                     lineval = float(lv)
                 except ValueError:
                     continue
-                hline = lineval if side == "home" else -lineval   # line on HOME
+                # home & draw keys are quoted on the HOME line; away flips sign
+                hline = -lineval if side == "away" else lineval
                 h = dcm.hcap_from_matrix(M, hline)
-                probs[k] = h["home_cover"] if side == "home" else h["away_cover"]
-                pushes[k] = h["push"]
+                # 3-way outcomes: home cover / handicap draw / away cover.
+                # h["push"] (adjusted-tie mass) is the draw probability here.
+                probs[k] = {"home": h["home_cover"], "away": h["away_cover"],
+                            "draw": h["push"]}.get(side)
         return probs, pushes
 
     def score_matrix(self, home, away, neutral=True, wc=False, reconcile=True):

@@ -9,7 +9,8 @@ CSV columns:
     home_win, draw, away_win,
     over_2.5, under_2.5,
     goals_0_1, goals_2_3, goals_4plus,
-    hcap_home_-1, hcap_away_+1, hcap_home_+1, hcap_away_-1
+    hcap_home_-1, hcap_draw_-1, hcap_away_+1,   (Taiwan 3-way handicap, home -1 line)
+    hcap_home_+1, hcap_draw_+1, hcap_away_-1    (Taiwan 3-way handicap, home +1 line)
 
 Usage (from src/):
   python bet.py fixtures.csv --bankroll 1000 --kelly 0.25 --edge 0.03
@@ -23,7 +24,8 @@ import pandas as pd
 MARKET_COLS = ["home_win", "draw", "away_win",
                "over_2.5", "under_2.5",
                "goals_0_1", "goals_2_3", "goals_4plus",
-               "hcap_home_-1", "hcap_away_+1", "hcap_home_+1", "hcap_away_-1"]
+               "hcap_home_-1", "hcap_draw_-1", "hcap_away_+1",
+               "hcap_home_+1", "hcap_draw_+1", "hcap_away_-1"]
 
 
 def _bool(x, default):
