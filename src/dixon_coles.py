@@ -31,6 +31,39 @@ def _log_pois(k, lam):
     return k * np.log(lam) - lam - gammaln(k + 1)
 
 
+# -- markets derived from a scoreline matrix M (home goals x away goals) -------
+def _grids(n):
+    i = np.arange(n)
+    return np.subtract.outer(i, i), np.add.outer(i, i)   # home-away diff, total
+
+
+def onextwo_from_matrix(M) -> dict:
+    diff, _ = _grids(M.shape[0])
+    return {"home_win": float(M[diff > 0].sum()), "draw": float(M[diff == 0].sum()),
+            "away_win": float(M[diff < 0].sum())}
+
+
+def ou_from_matrix(M, line=2.5) -> dict:
+    _, tot = _grids(M.shape[0])
+    over = float(M[tot > line].sum())
+    return {f"over_{line}": over, f"under_{line}": 1 - over}
+
+
+def totals_from_matrix(M) -> dict:
+    _, tot = _grids(M.shape[0])
+    return {"goals_0_1": float(M[tot <= 1].sum()),
+            "goals_2_3": float(M[(tot >= 2) & (tot <= 3)].sum()),
+            "goals_4plus": float(M[tot >= 4].sum())}
+
+
+def hcap_from_matrix(M, line=-1.0) -> dict:
+    diff, _ = _grids(M.shape[0])
+    adj = diff + line
+    return {"home_cover": float(M[adj > 0].sum()),
+            "push": float(M[adj == 0].sum()) if float(line) == int(line) else 0.0,
+            "away_cover": float(M[adj < 0].sum())}
+
+
 class DixonColes:
     def __init__(self, xi: float = 0.0004, reg: float = 0.5,
                  cap_goals: int = 10, max_iter: int = 400):
@@ -130,15 +163,27 @@ class DixonColes:
     # -- secondary markets (the real payoff) --------------------------------
     def over_under(self, home, away, line=2.5, neutral=True, max_goals=10,
                    goal_scale=1.0) -> dict:
-        M = self.score_matrix(home, away, neutral, max_goals, goal_scale)
-        tot = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
-        over = float(M[tot > line].sum())
-        return {f"over_{line}": over, f"under_{line}": 1 - over}
+        return ou_from_matrix(
+            self.score_matrix(home, away, neutral, max_goals, goal_scale), line)
 
     def expected_goals(self, home, away, neutral=True, goal_scale=1.0) -> dict:
         lam, mu = self.rates(home, away, neutral)
         return {"home_xg": lam * goal_scale, "away_xg": mu * goal_scale,
                 "total_xg": (lam + mu) * goal_scale}
+
+    def handicap(self, home, away, line=-1.0, neutral=True, max_goals=10,
+                 goal_scale=1.0) -> dict:
+        """Asian handicap applied to the HOME team (line<0 => home favoured, must
+        win by more than |line|). Cover probabilities with the PUSH (exact line,
+        stake returned) separated out -- needed for correct EV."""
+        return hcap_from_matrix(
+            self.score_matrix(home, away, neutral, max_goals, goal_scale), line)
+
+    def total_buckets(self, home, away, neutral=True, max_goals=10,
+                      goal_scale=1.0) -> dict:
+        """Total-goals buckets 0-1 / 2-3 / 4+ (mutually exclusive, sum to 1)."""
+        return totals_from_matrix(
+            self.score_matrix(home, away, neutral, max_goals, goal_scale))
 
 
 WC_GOAL_SCALE = 1.08   # World Cup finals score ~8% more than the all-matches fit

@@ -35,30 +35,93 @@ def implied_probs(odds: dict) -> dict:
     return {k: (1.0 / odds[k] if odds.get(k, 0) > 0 else np.nan) for k in OUTCOMES}
 
 
+# -- devig: strip the bookmaker margin -> fair probabilities -------------------
+def devig(odds: dict, method: str = "shin") -> dict:
+    """Fair (vig-free) probabilities for a set of mutually-exclusive outcome odds.
+    'multiplicative' just normalises 1/odds to sum to 1; 'shin' additionally
+    corrects the favourite-longshot bias (assumes a little insider money)."""
+    keys = [k for k in odds if odds.get(k, 0) > 1]
+    inv = np.array([1.0 / odds[k] for k in keys])
+    B = inv.sum()
+    if len(keys) < 2 or B <= 0:
+        return {k: float(v) for k, v in zip(keys, inv / B if B else inv)}
+    if method == "shin":
+        from scipy.optimize import brentq
+
+        def shin_p(z):
+            return (np.sqrt(z * z + 4 * (1 - z) * inv * inv / B) - z) / (2 * (1 - z))
+        try:
+            z = brentq(lambda z: shin_p(z).sum() - 1.0, 1e-9, 0.5)
+            p = shin_p(z)
+        except ValueError:
+            p = inv / B                              # fall back to multiplicative
+    else:
+        p = inv / B
+    return {k: float(pi) for k, pi in zip(keys, p)}
+
+
+def _market_groups(odds: dict) -> list:
+    """Split a flat odds dict into the mutually-exclusive markets to devig
+    separately (1X2, each over/under line, totals buckets, each handicap line)."""
+    g: dict = {}
+    for k in odds:
+        if k in ("home_win", "draw", "away_win"):
+            g.setdefault("1x2", []).append(k)
+        elif k.startswith(("over_", "under_")):
+            g.setdefault("ou_" + k.split("_", 1)[1], []).append(k)
+        elif k.startswith("goals_"):
+            g.setdefault("totals", []).append(k)
+        elif k.startswith("hcap_"):
+            g.setdefault("hcap_" + k.split("_")[2].lstrip("+-"), []).append(k)
+        else:
+            g.setdefault(k, []).append(k)
+    return list(g.values())
+
+
+def fair_book(odds: dict, method: str = "shin") -> dict:
+    """Per-outcome fair probability, devigging each market in `odds` separately."""
+    fp = {}
+    for keys in _market_groups(odds):
+        fp.update(devig({k: odds[k] for k in keys}, method))
+    return fp
+
+
 def find_bets(label: str, probs: dict, odds: dict,
-              kelly: float = 0.25, edge_threshold: float = 0.03) -> list:
+              kelly: float = 0.25, edge_threshold: float = 0.03,
+              pushes: dict = None, devig_method: str = "shin") -> list:
     """All +EV outcomes for one match (before global capping). Works for ANY
-    market in `odds` (1X2, over_2.5, under_2.5, ...) as long as `probs` has a
-    matching model probability for that key."""
+    market in `odds` (1X2, over/under, goal buckets, handicap, ...) as long as
+    `probs` has a model probability for that key. `pushes[key]` (e.g. an Asian
+    handicap landing exactly on the line) returns the stake, so EV and Kelly use
+    edge = p*o - (1 - push); full-Kelly = edge / (o - 1).
+
+    `fair_p` is the bookmaker's vig-free probability (devigged); `vs_fair` =
+    p_model - fair_p flags whether you genuinely disagree with the SHARP market
+    (>0) or your raw edge is mostly the bookmaker's margin (<0)."""
+    pushes = pushes or {}
+    fair = fair_book(odds, devig_method)
     bets = []
     for k, o in odds.items():
         p = probs.get(k)
         if p is None or not o or o <= 1:
             continue
-        edge = p * o - 1.0
+        q = float(pushes.get(k, 0.0))
+        edge = p * o - (1.0 - q)
         if edge >= edge_threshold:
+            kf = max(edge / (o - 1.0), 0.0)
             bets.append({
-                "match": label, "bet": k, "p_model": p, "book_p": 1.0 / o,
-                "odds": o, "edge": edge, "kelly_full": kelly_fraction(p, o),
-                "stake": kelly * kelly_fraction(p, o),
+                "match": label, "bet": k, "p_model": p, "push": q,
+                "fair_p": fair.get(k, np.nan), "book_p": 1.0 / o, "odds": o,
+                "vs_fair": p - fair.get(k, np.nan), "edge": edge,
+                "kelly_full": kf, "stake": kelly * kf,
             })
     return bets
 
 
 def build_portfolio(matches: list, bankroll: float = 1000.0,
                     kelly: float = 0.5, edge_threshold: float = 0.05,
-                    max_per_bet: float = 0.2, max_exposure: float = 0.7
-                    ) -> pd.DataFrame:
+                    max_per_bet: float = 0.2, max_exposure: float = 0.7,
+                    devig_method: str = "shin") -> pd.DataFrame:
     """matches: [{'label', 'probs': {...}, 'odds': {...}}, ...]
     Returns a DataFrame of recommended bets with stake fractions and EUR amounts.
 
@@ -67,7 +130,8 @@ def build_portfolio(matches: list, bankroll: float = 1000.0,
     rows = []
     for m in matches:
         rows += find_bets(m.get("label", f"{m.get('home','?')} v {m.get('away','?')}"),
-                          m["probs"], m["odds"], kelly, edge_threshold)
+                          m["probs"], m["odds"], kelly, edge_threshold,
+                          m.get("pushes"), devig_method)
     df = pd.DataFrame(rows)
     if df.empty:
         print("No +EV bets cleared the edge threshold "
@@ -88,9 +152,9 @@ def build_portfolio(matches: list, bankroll: float = 1000.0,
 def show_portfolio(df: pd.DataFrame, bankroll: float = 1000.0) -> None:
     if df is None or df.empty:
         return
-    view = df[["match", "bet", "p_model", "book_p", "odds",
-               "edge", "stake", "stake_eur", "exp_profit_eur"]].copy()
-    for c in ["p_model", "book_p", "edge", "stake"]:
+    view = df[["match", "bet", "p_model", "fair_p", "vs_fair", "odds",
+               "edge", "stake", "stake_eur"]].copy()
+    for c in ["p_model", "fair_p", "vs_fair", "edge", "stake"]:
         view[c] = (view[c] * 100).round(1).astype(str) + "%"
     print(view.to_string(index=False))
     print(f"\n  bets: {len(df)}   total staked: "
@@ -103,12 +167,13 @@ def portfolio_from_predictor(predictor, matches: list, **kw) -> pd.DataFrame:
     Fills in model probabilities via the predictor, then builds the portfolio."""
     enriched = []
     for m in matches:
-        # ask the predictor for every market the odds reference (1X2 + O/U lines)
-        probs = predictor.predict_markets(m["home"], m["away"],
-                                          m.get("neutral", True),
-                                          odds_keys=list(m["odds"].keys()))
+        # ask the predictor for every market the odds reference (1X2, O/U, goal
+        # buckets, handicap); pushes come back for handicap lines.
+        probs, pushes = predictor.predict_markets(
+            m["home"], m["away"], m.get("neutral", True),
+            odds_keys=list(m["odds"].keys()), wc=m.get("wc", False))
         enriched.append({"label": m.get("label", f"{m['home']} v {m['away']}"),
-                         "probs": probs, "odds": m["odds"]})
+                         "probs": probs, "odds": m["odds"], "pushes": pushes})
     bankroll = kw.get("bankroll", 1000.0)
     df = build_portfolio(enriched, **kw)
     show_portfolio(df, bankroll)
@@ -125,11 +190,13 @@ if __name__ == "__main__":
     matches = [
         {"home": "Spain", "away": "England", "neutral": True,
          "odds": {"home_win": 2.10, "draw": 3.30, "away_win": 4.20,
-                  "over_2.5": 2.05, "under_2.5": 1.75}},      # secondary market
-        {"home": "France", "away": "Germany", "neutral": True,
-         "odds": {"home_win": 1.80, "draw": 3.60, "away_win": 4.50}},
+                  # secondary markets: totals buckets + Asian handicap +/-1
+                  "goals_0_1": 3.40, "goals_2_3": 1.95, "goals_4plus": 4.50,
+                  "hcap_home_-1": 3.60, "hcap_away_+1": 1.28}},
         {"home": "Brazil", "away": "Argentina", "neutral": True,
-         "odds": {"home_win": 3.10, "draw": 3.10, "away_win": 2.40}},
+         "odds": {"home_win": 3.10, "draw": 3.10, "away_win": 2.40,
+                  "hcap_away_-1": 4.20, "hcap_home_+1": 1.25}},
     ]
-    print("\nPortfolio (1/4 Kelly, demo odds):\n")
-    portfolio_from_predictor(pr, matches, bankroll=1000.0)
+    print("\nPortfolio (1/4 Kelly, demo odds; incl. totals buckets + handicap):\n")
+    portfolio_from_predictor(pr, matches, bankroll=1000.0, kelly=0.25,
+                             edge_threshold=0.03)

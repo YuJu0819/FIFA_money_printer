@@ -1,0 +1,15 @@
+# Core runtime (model + betting layer)
+numpy==2.4.6
+pandas==3.0.3
+scikit-learn==1.8.0
+scipy==1.17.1
+matplotlib==3.10.9
+
+# Data download (results.csv + salimt dump)
+kagglehub==0.3.13
+
+# Optional: regenerate SUMMARY.pdf from SUMMARY.md
+markdown-pdf
+
+# Optional: the EBM experiment (not used by the model)
+# interpret-core==0.7.8

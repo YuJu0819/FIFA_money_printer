@@ -21,9 +21,10 @@ betting signals (1X2 **and** secondary markets) with a staked portfolio.
 | wc_squad_dataset.py | Builds the country squad-value series offline; SquadValuer for live overrides |
 | dixon_coles.py | Dixon-Coles goals model -> scoreline matrix -> 1X2 + secondary markets |
 | walk_forward.py | Walk-forward backtest, model registry (LR/HGB), compare_models, IS/OOS/gap |
-| predict.py | MatchPredictor: LR+DC blend, secondary markets, absence override (synthetic-row) |
-| portfolio.py | EV + fractional-Kelly staking across any market (1X2, O/U, ...) |
+| predict.py | MatchPredictor: LR+DC blend, secondary markets (blend-reconciled), absence override |
+| portfolio.py | Devig (Shin) + EV + push-aware fractional-Kelly across any market |
 | run_with_mv.py | One-command end-to-end runner |
+| chemistry.py | Causal club-chemistry feature (built, tested NULL; reference tool) |
 
 ## Model features (12, all causal pre-match snapshots)
 - `elo_diff` — competition-weighted Elo (the dominant signal)
@@ -84,14 +85,31 @@ that need information no historical feature contains (lineups, motivation, one-o
   blend (optimal weight ~flat by |elo|) — both null.
 - **Pairwise "bogey team" effect beyond Elo** — corr(prior pair residual, current) = +0.017;
   when model and H2H disagree the MODEL is right 62% of the time. H2H post-processing hurts.
+- **Momentum / win-streak** — residual corr ~0 (-0.02); already captured by Elo + form.
+- **Squad CHEMISTRY** (causal, dated from transfer_history) — orthogonal to strength (first
+  non-redundant idea!) but corr(chem_diff, residual) = -0.007; small-nation/few-clubs artifact,
+  not a winning signal.
+- **Squad-value CONCENTRATION** (Gini / CV / top-1 share) — distribution shape, also null
+  (residual corr ~0). Pattern confirmed: orthogonal != predictive; Elo integrates everything
+  that shows up in results.
+
+One thing that DID test real beyond the model: **World Cup goal-scale** -- WC finals score
+~8% more than DC predicts (validated, ~2.6 SE / 444 matches), so `wc=True` applies a 1.08
+scaling that sharpens totals / correct-score (1X2 unchanged).
 
 ## Prediction + betting layer
 - `MatchPredictor.predict(home, away, neutral, unavailable={team:[players]})` -> 1X2 blend.
-  Uses the synthetic-row method (appends the fixture, re-runs build_features) so live and
-  training features can never drift. `predict_components`, `over_under`, `score_matrix`,
-  `expected_goals`, `squad(team)` expose the goals model and secondary markets.
-- `portfolio.py` — per outcome, edge = p_model*odds - 1; bets above a threshold sized by
-  fractional Kelly with exposure caps; works for ANY market (1X2, over/under, ...).
+  Synthetic-row method (appends the fixture, re-runs build_features) so live and training
+  features can never drift. `unavailable=` drops named players (absence override); `wc=True`
+  applies the World Cup goal-scale.
+- **Markets** (all from the Dixon-Coles scoreline matrix): 1X2, over/under, total-goals
+  buckets (0-1 / 2-3 / 4+), Asian handicap +/-1 (with push). Secondary markets are derived
+  from a matrix RECONCILED to the blend's better 1X2 -- so the handicap inherits the
+  blend's calibration (0.8393) plus DC's "win by 1 vs by 2+" margin shape.
+- `portfolio.py` — **devig** (Shin / multiplicative) gives the bookmaker's fair probability;
+  `vs_fair` = p_model - fair flags genuine disagreement with the sharp market vs a vig
+  illusion. **Push-aware** EV/Kelly (edge = p*o - (1-push)); fractional Kelly + exposure caps;
+  any market.
 
 ## How to run (from src/)
 ```

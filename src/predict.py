@@ -167,27 +167,77 @@ class MatchPredictor:
         from dixon_coles import WC_GOAL_SCALE
         return WC_GOAL_SCALE if wc else 1.0
 
+    def _reconcile(self, M, blend):
+        """Rescale the DC scoreline matrix so its W/D/L marginals equal the LR+DC
+        blend -- injects the better-calibrated 1X2 into the secondary markets
+        (esp. handicap/margin) while keeping DC's within-outcome score shape."""
+        import dixon_coles as dcm
+        dc12 = dcm.onextwo_from_matrix(M)
+        n = M.shape[0]
+        diff = np.subtract.outer(np.arange(n), np.arange(n))
+        M2 = M.copy()
+        for region, key in ((diff > 0, "home_win"), (diff == 0, "draw"),
+                            (diff < 0, "away_win")):
+            if dc12[key] > 0:
+                M2[region] *= blend[key] / dc12[key]
+        return M2 / M2.sum()
+
+    def _market_matrix(self, home, away, neutral, wc, reconcile, blend=None):
+        M = self.dc.score_matrix(home, away, neutral, goal_scale=self._gs(wc))
+        if reconcile:
+            M = self._reconcile(M, blend or self.predict(home, away, neutral))
+        return M
+
     def predict_markets(self, home, away, neutral=True, odds_keys=None,
-                        wc=False) -> dict:
-        """1X2 (blended) plus any over_X / under_X markets implied by odds_keys."""
-        out = self.predict(home, away, neutral)
-        gs = self._gs(wc)
-        if self.dc is not None and odds_keys:
-            for k in odds_keys:
-                if k.startswith(("over_", "under_")):
-                    try:
-                        line = float(k.split("_", 1)[1])
-                    except ValueError:
-                        continue
-                    out.update(self.dc.over_under(home, away, line, neutral,
-                                                  goal_scale=gs))
-        return out
+                        wc=False, reconcile=True):
+        """Returns (probs, pushes). Handles, by odds key:
+          home_win/draw/away_win    -- 1X2 blend
+          over_X / under_X          -- totals line X
+          goals_0_1/2_3/4plus       -- total-goals buckets
+          hcap_home_-1 / hcap_away_+1 / ... -- Asian handicap (push in `pushes`)
+        reconcile=True derives the secondary markets from the blend-rescaled
+        scoreline matrix (better-calibrated 1X2 baked in)."""
+        import dixon_coles as dcm
+        probs = self.predict(home, away, neutral)
+        pushes = {}
+        if self.dc is None or not odds_keys:
+            return probs, pushes
+        M = self._market_matrix(home, away, neutral, wc, reconcile, blend=probs)
+        for k in odds_keys:
+            if k.startswith(("over_", "under_")):
+                try:
+                    line = float(k.split("_", 1)[1])
+                except ValueError:
+                    continue
+                probs.update(dcm.ou_from_matrix(M, line))
+            elif k in ("goals_0_1", "goals_2_3", "goals_4plus"):
+                probs.update(dcm.totals_from_matrix(M))
+            elif k.startswith("hcap_"):
+                try:
+                    _, side, lv = k.split("_")
+                    lineval = float(lv)
+                except ValueError:
+                    continue
+                hline = lineval if side == "home" else -lineval   # line on HOME
+                h = dcm.hcap_from_matrix(M, hline)
+                probs[k] = h["home_cover"] if side == "home" else h["away_cover"]
+                pushes[k] = h["push"]
+        return probs, pushes
 
-    def score_matrix(self, home, away, neutral=True, max_goals=10, wc=False):
-        return self.dc.score_matrix(home, away, neutral, max_goals, self._gs(wc))
+    def score_matrix(self, home, away, neutral=True, wc=False, reconcile=True):
+        return self._market_matrix(home, away, neutral, wc, reconcile)
 
-    def over_under(self, home, away, line=2.5, neutral=True, wc=False):
-        return self.dc.over_under(home, away, line, neutral, goal_scale=self._gs(wc))
+    def over_under(self, home, away, line=2.5, neutral=True, wc=False, reconcile=True):
+        import dixon_coles as dcm
+        return dcm.ou_from_matrix(self._market_matrix(home, away, neutral, wc, reconcile), line)
+
+    def handicap(self, home, away, line=-1.0, neutral=True, wc=False, reconcile=True):
+        import dixon_coles as dcm
+        return dcm.hcap_from_matrix(self._market_matrix(home, away, neutral, wc, reconcile), line)
+
+    def total_buckets(self, home, away, neutral=True, wc=False, reconcile=True):
+        import dixon_coles as dcm
+        return dcm.totals_from_matrix(self._market_matrix(home, away, neutral, wc, reconcile))
 
     def expected_goals(self, home, away, neutral=True, wc=False):
         return self.dc.expected_goals(home, away, neutral, goal_scale=self._gs(wc))
